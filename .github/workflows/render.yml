@@ -1,120 +1,134 @@
-name: Render HTML to MP4 Video
+name: Render hadith video
+
+# Actions tab → "Render hadith video" → Run workflow
+# When it finishes, download the "hadith-video" zip from Artifacts.
 
 on:
   workflow_dispatch:
     inputs:
-      html_path:
-        description: 'Path to HTML file (e.g. index.html or public/index.html)'
-        required: true
-        default: 'index.html'
-      duration:
-        description: 'Video duration in seconds'
-        required: true
-        default: '10'
-      output_name:
-        description: 'Output MP4 file name'
-        required: true
-        default: 'rendered-video.mp4'
+      test_seconds:
+        description: "Test only: render the first N seconds (empty = full video)"
+        required: false
+        default: ""
+        type: string
+      workers:
+        description: "Parallel browsers (empty = auto, recommended 4)"
+        required: false
+        default: ""
+        type: string
 
-  push:
-    branches:
-      - main
-    paths:
-      - '**.html'
-      - '**.js'
-      - '**.css'
+permissions:
+  contents: read
+
+concurrency:
+  group: render-hadith-video
+  cancel-in-progress: false
 
 jobs:
   render:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
+    
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 22
           cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
 
-      - name: Install System Dependencies (FFmpeg & Chromium Dependencies)
+      - name: Validate project files
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 libnss3
+          echo "Checking required files..."
+          test -f index.html || (echo "::error::index.html not found" && exit 1)
+          test -f render.js || (echo "::error::render.js not found" && exit 1)
+          test -f package.json || (echo "::error::package.json not found" && exit 1)
+          test -f timestamps.txt || test -f timestamps01.txt || (echo "::warning::timestamps.txt not found, render.js will handle")
+          ls -lh
+          echo "✓ Core files present"
 
-      - name: Install Project Dependencies
+      - name: Install FFmpeg and fonts
         run: |
-          if [ -f package.json ]; then
-            npm ci || npm install
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends             ffmpeg             fonts-noto-core             fonts-hosny-amiri             fonts-freefont-ttf             fonts-dejavu-core             fontconfig
+          fc-cache -fv
+          ffmpeg -version | head -n1
+          fc-list | grep -i "Noto.*Bengali" | head -n3 || true
+          echo "✓ FFmpeg and fonts installed"
+
+      - name: Install NPM dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
           else
-            npm init -y
-            npm install puppeteer
+            npm install
           fi
 
-      - name: Execute HTML to MP4 Conversion Script
-        env:
-          HTML_PATH: ${{ github.event.inputs.html_path || 'index.html' }}
-          DURATION: ${{ github.event.inputs.duration || '10' }}
-          OUTPUT_NAME: ${{ github.event.inputs.output_name || 'rendered-video.mp4' }}
+      - name: Install Playwright Chromium
         run: |
-          node - << 'EOF'
-          const puppeteer = require('puppeteer');
-          const { execSync } = require('child_process');
-          const fs = require('fs');
-          const path = require('path');
+          npx playwright install --with-deps chromium
+          npx playwright --version
 
-          const htmlPath = process.env.HTML_PATH;
-          const duration = parseInt(process.env.DURATION, 10);
-          const outputName = process.env.OUTPUT_NAME;
-          const framesDir = path.join(__dirname, 'temp_frames');
+      - name: Prepare audio and assets check
+        run: |
+          echo "Assets in repo:"
+          ls -lh *.mp3 *.jpg *.jpeg *.png 2>/dev/null || echo "No media in root (check names)"
+          if [ -f audio.mp3 ]; then
+            echo "Audio duration:"
+            ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 audio.mp3 || true
+          fi
 
-          if (!fs.existsSync(framesDir)) {
-              fs.mkdirSync(framesDir);
-          }
+      - name: Render video
+        env:
+          TEST_SECONDS: ${{ github.event.inputs.test_seconds }}
+          WORKERS: ${{ github.event.inputs.workers }}
+        run: |
+          set -e
+          ARGS=""
+          if [ -n "$TEST_SECONDS" ]; then
+            echo "▶ Test mode: first $TEST_SECONDS seconds"
+            ARGS="$ARGS --test $TEST_SECONDS"
+          else
+            echo "▶ Full video mode"
+          fi
+          if [ -n "$WORKERS" ]; then
+            echo "▶ Using $WORKERS workers"
+            ARGS="$ARGS --workers $WORKERS"
+          fi
+          echo "Command: node render.js $ARGS"
+          node render.js $ARGS
+          echo "✓ Render completed"
+          ls -lh *.mp4 || (echo "::error::MP4 not generated" && exit 1)
 
-          (async () => {
-              console.log(`Starting headless browser for: ${htmlPath}`);
-              const browser = await puppeteer.launch({
-                  headless: 'new',
-                  args: ['--no-sandbox', '--disable-setuid-sandbox']
-              });
-              const page = await browser.newPage();
-              
-              // 1080p Full HD Resolution
-              await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
-              
-              const absoluteHtmlPath = path.isAbsolute(htmlPath) ? htmlPath : path.join(process.cwd(), htmlPath);
-              await page.goto(`file://${absoluteHtmlPath}`, { waitUntil: 'networkidle0' });
+      - name: Verify output
+        if: always()
+        run: |
+          if [ -f hadith-video.mp4 ]; then
+            echo "Output info:"
+            ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name -of default=noprint_wrappers=1 hadith-video.mp4 || true
+            ls -lh hadith-video.mp4
+          else
+            echo "::warning::hadith-video.mp4 not found, checking any mp4"
+            ls -lh *.mp4 || true
+          fi
 
-              const fps = 30;
-              const totalFrames = duration * fps;
-              console.log(`Capturing ${totalFrames} frames at ${fps} FPS (${duration} seconds)...`);
-
-              for (let i = 0; i < totalFrames; i++) {
-                  const frameNumber = String(i).padStart(4, '0');
-                  const framePath = path.join(framesDir, `frame_${frameNumber}.png`);
-                  await page.screenshot({ path: framePath, type: 'png' });
-                  
-                  // Wait for 1 frame duration (approx 33.3ms for 30fps)
-                  await new Promise(resolve => setTimeout(resolve, 1000 / fps));
-              }
-
-              await browser.close();
-              console.log('Frame capture completed. Encoding MP4 video with FFmpeg...');
-
-              const ffmpegCmd = `ffmpeg -y -framerate ${fps} -i "${framesDir}/frame_%04d.png" -c:v libx264 -pix_fmt yuv420p -preset fast -crf 18 "${outputName}"`;
-              execSync(ffmpegCmd, { stdio: 'inherit' });
-
-              // Clean up temporary frame images
-              fs.rmSync(framesDir, { recursive: true, force: true });
-              console.log(`Successfully generated video: ${outputName}`);
-          })();
-          EOF
-
-      - name: Upload Generated Video as Artifact
+      - name: Upload video artifact
         uses: actions/upload-artifact@v4
         with:
-          name: generated-mp4-video
-          path: ${{ github.event.inputs.output_name || 'rendered-video.mp4' }}
-          retention-days: 7
+          name: hadith-video
+          path: hadith-video.mp4
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload frames on failure (for debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: /tmp/*.jpg
+          if-no-files-found: ignore
+          retention-days: 3
