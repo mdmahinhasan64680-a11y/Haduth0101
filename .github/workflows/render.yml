@@ -1,61 +1,120 @@
-name: Render hadith video
+name: Render HTML to MP4 Video
 
-# Actions tab → "Render hadith video" → Run workflow
-# When it finishes, download the "hadith-video" zip from the Artifacts section of the run page.
 on:
   workflow_dispatch:
     inputs:
-      test_seconds:
-        description: "Test only: render the first N seconds (leave empty for the full video)"
-        required: false
-        default: ""
-      workers:
-        description: "Parallel browsers (empty = auto)"
-        required: false
-        default: ""
+      html_path:
+        description: 'Path to HTML file (e.g. index.html or public/index.html)'
+        required: true
+        default: 'index.html'
+      duration:
+        description: 'Video duration in seconds'
+        required: true
+        default: '10'
+      output_name:
+        description: 'Output MP4 file name'
+        required: true
+        default: 'rendered-video.mp4'
 
-permissions:
-  contents: read
+  push:
+    branches:
+      - main
+    paths:
+      - '**.html'
+      - '**.js'
+      - '**.css'
 
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Install FFmpeg and fonts
+      - name: Install System Dependencies (FFmpeg & Chromium Dependencies)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core fonts-hosny-amiri fonts-freefont-ttf fonts-dejavu-core
-          fc-cache -f
+          sudo apt-get install -y ffmpeg libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 libnss3
 
-      - name: Install dependencies
+      - name: Install Project Dependencies
         run: |
-          npm install
-          npx playwright install --with-deps chromium
+          if [ -f package.json ]; then
+            npm ci || npm install
+          else
+            npm init -y
+            npm install puppeteer
+          fi
 
-      - name: Render video
+      - name: Execute HTML to MP4 Conversion Script
         env:
-          TEST_SECONDS: ${{ github.event.inputs.test_seconds }}
-          WORKERS: ${{ github.event.inputs.workers }}
+          HTML_PATH: ${{ github.event.inputs.html_path || 'index.html' }}
+          DURATION: ${{ github.event.inputs.duration || '10' }}
+          OUTPUT_NAME: ${{ github.event.inputs.output_name || 'rendered-video.mp4' }}
         run: |
-          ARGS=""
-          if [ -n "$TEST_SECONDS" ]; then ARGS="$ARGS --test $TEST_SECONDS"; fi
-          if [ -n "$WORKERS" ]; then ARGS="$ARGS --workers $WORKERS"; fi
-          node render.js $ARGS
+          node - << 'EOF'
+          const puppeteer = require('puppeteer');
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
 
-      - name: Upload video
+          const htmlPath = process.env.HTML_PATH;
+          const duration = parseInt(process.env.DURATION, 10);
+          const outputName = process.env.OUTPUT_NAME;
+          const framesDir = path.join(__dirname, 'temp_frames');
+
+          if (!fs.existsSync(framesDir)) {
+              fs.mkdirSync(framesDir);
+          }
+
+          (async () => {
+              console.log(`Starting headless browser for: ${htmlPath}`);
+              const browser = await puppeteer.launch({
+                  headless: 'new',
+                  args: ['--no-sandbox', '--disable-setuid-sandbox']
+              });
+              const page = await browser.newPage();
+              
+              // 1080p Full HD Resolution
+              await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
+              
+              const absoluteHtmlPath = path.isAbsolute(htmlPath) ? htmlPath : path.join(process.cwd(), htmlPath);
+              await page.goto(`file://${absoluteHtmlPath}`, { waitUntil: 'networkidle0' });
+
+              const fps = 30;
+              const totalFrames = duration * fps;
+              console.log(`Capturing ${totalFrames} frames at ${fps} FPS (${duration} seconds)...`);
+
+              for (let i = 0; i < totalFrames; i++) {
+                  const frameNumber = String(i).padStart(4, '0');
+                  const framePath = path.join(framesDir, `frame_${frameNumber}.png`);
+                  await page.screenshot({ path: framePath, type: 'png' });
+                  
+                  // Wait for 1 frame duration (approx 33.3ms for 30fps)
+                  await new Promise(resolve => setTimeout(resolve, 1000 / fps));
+              }
+
+              await browser.close();
+              console.log('Frame capture completed. Encoding MP4 video with FFmpeg...');
+
+              const ffmpegCmd = `ffmpeg -y -framerate ${fps} -i "${framesDir}/frame_%04d.png" -c:v libx264 -pix_fmt yuv420p -preset fast -crf 18 "${outputName}"`;
+              execSync(ffmpegCmd, { stdio: 'inherit' });
+
+              // Clean up temporary frame images
+              fs.rmSync(framesDir, { recursive: true, force: true });
+              console.log(`Successfully generated video: ${outputName}`);
+          })();
+          EOF
+
+      - name: Upload Generated Video as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hadith-video
-          path: hadith-video.mp4
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
+          name: generated-mp4-video
+          path: ${{ github.event.inputs.output_name || 'rendered-video.mp4' }}
+          retention-days: 7
