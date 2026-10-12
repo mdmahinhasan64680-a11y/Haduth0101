@@ -1,1 +1,1 @@
-# Haduth0101
+# Hadith Video Project\nMaster prompt compliant\n\n## Render steps\n1. Upload all files to GitHub repo keeping .github/workflows/render.yml path\n2. Add audio.mp3\n3. Actions -> Render hadith video -> Run\n4. Download artifact hadith-video\n
