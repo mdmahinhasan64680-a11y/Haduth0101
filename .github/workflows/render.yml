@@ -1,8 +1,5 @@
 name: Render hadith video
 
-# Actions tab → "Render hadith video" → Run workflow
-# When it finishes, download the "hadith-video" zip from Artifacts.
-
 on:
   workflow_dispatch:
     inputs:
@@ -37,8 +34,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
-          cache-dependency-path: '**/package-lock.json'
 
       - name: Validate project files
         run: |
@@ -46,18 +41,20 @@ jobs:
           test -f index.html || (echo "::error::index.html not found" && exit 1)
           test -f render.js || (echo "::error::render.js not found" && exit 1)
           test -f package.json || (echo "::error::package.json not found" && exit 1)
-          test -f timestamps.txt || test -f timestamps01.txt || (echo "::warning::timestamps.txt not found, render.js will handle")
           ls -lh
-          echo "✓ Core files present"
 
       - name: Install FFmpeg and fonts
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends             ffmpeg             fonts-noto-core             fonts-hosny-amiri             fonts-freefont-ttf             fonts-dejavu-core             fontconfig
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            fonts-noto-core \
+            fonts-hosny-amiri \
+            fonts-freefont-ttf \
+            fonts-dejavu-core \
+            fontconfig
           fc-cache -fv
           ffmpeg -version | head -n1
-          fc-list | grep -i "Noto.*Bengali" | head -n3 || true
-          echo "✓ FFmpeg and fonts installed"
 
       - name: Install NPM dependencies
         run: |
@@ -70,15 +67,14 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           npx playwright install --with-deps chromium
-          npx playwright --version
 
-      - name: Prepare audio and assets check
+      - name: Prepare assets
         run: |
-          echo "Assets in repo:"
-          ls -lh *.mp3 *.jpg *.jpeg *.png 2>/dev/null || echo "No media in root (check names)"
+          ls -lh *.mp3 *.png *.jpg 2>/dev/null || echo "Checking assets..."
           if [ -f audio.mp3 ]; then
-            echo "Audio duration:"
             ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 audio.mp3 || true
+          else
+            echo "::warning::audio.mp3 not found - will render silent video"
           fi
 
       - name: Render video
@@ -91,8 +87,6 @@ jobs:
           if [ -n "$TEST_SECONDS" ]; then
             echo "▶ Test mode: first $TEST_SECONDS seconds"
             ARGS="$ARGS --test $TEST_SECONDS"
-          else
-            echo "▶ Full video mode"
           fi
           if [ -n "$WORKERS" ]; then
             echo "▶ Using $WORKERS workers"
@@ -100,19 +94,14 @@ jobs:
           fi
           echo "Command: node render.js $ARGS"
           node render.js $ARGS
-          echo "✓ Render completed"
-          ls -lh *.mp4 || (echo "::error::MP4 not generated" && exit 1)
+          ls -lh *.mp4
 
       - name: Verify output
         if: always()
         run: |
           if [ -f hadith-video.mp4 ]; then
-            echo "Output info:"
-            ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name -of default=noprint_wrappers=1 hadith-video.mp4 || true
+            ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,codec_name -of default=noprint_wrappers=1 hadith-video.mp4 || true
             ls -lh hadith-video.mp4
-          else
-            echo "::warning::hadith-video.mp4 not found, checking any mp4"
-            ls -lh *.mp4 || true
           fi
 
       - name: Upload video artifact
@@ -124,11 +113,11 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      - name: Upload frames on failure (for debug)
+      - name: Upload frames on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: /tmp/*.jpg
+          name: debug-frames
+          path: /tmp/**/f*.jpg
           if-no-files-found: ignore
           retention-days: 3
